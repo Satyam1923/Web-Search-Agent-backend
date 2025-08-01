@@ -8,7 +8,7 @@ __pycache__/
 
 # Virtual environment
 myenv/
-
+chroma_langchain_db/
 # VS Code settings (optional)
 .vscode/
 
