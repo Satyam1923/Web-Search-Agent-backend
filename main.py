@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware  
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import os
 import getpass
@@ -25,15 +25,13 @@ logger = logging.getLogger(__name__)
 
 # ------------------ FastAPI App ------------------
 app = FastAPI(title="Web Search API", description="API for performing web searches and generating summaries.")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
 
 # ------------------ Pydantic Models ------------------
 class SearchQuery(BaseModel):
@@ -73,7 +71,6 @@ def cosine_similarity(vec1, vec2):
 persist_directory = "./chroma_langchain_db"
 client = chromadb.PersistentClient(path=persist_directory)
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
 collection = client.get_or_create_collection(name="web_search")
 vector_store = Chroma(
     collection_name="web_search",
@@ -99,35 +96,28 @@ list_stored_queries()
 # ------------------ Query Validation Prompt ------------------
 validation_prompt = ChatPromptTemplate.from_messages([
     SystemMessage(content=(
-        "You are a binary classifier. Your only job is to determine if a user’s message is a VALID web search query.\n\n"
-        "✅ VALID queries:\n"
-        "- Ask for information that can be answered by public web pages.\n"
-        "- Are factual, research-based, or general-interest questions.\n"
-        "- Do not require personal context, actions, reminders, or assistant behavior.\n\n"
-
-        "❌ INVALID queries:\n"
-        "- Contain commands, requests, or personal tasks (e.g. 'make', 'remind', 'add', 'call').\n"
-        "- Would not produce useful web results if searched.\n"
-        "- Ask the assistant to do something rather than ask for knowledge.\n\n"
-
-        "Examples (VALID):\n"
-        "- How to train a cat to run?\n"
-        "- Benefits of cats exercising\n"
-        "- Cat running tips\n\n"
-
-        "Examples (INVALID):\n"
-        "- Make my cat run\n"
-        "- Add this to my list\n"
-        "- Send message to John\n"
-        "- Remind me to feed the cat\n\n"
-
-        "Respond ONLY with:\n"
-        "yes — if it is a valid, informational query that belongs in a search engine\n"
-        "no — if it is a command, vague, or not suitable for search engines\n"
-        "Do NOT include any other text or explanation."
+        "You are a binary classifier. Your job is to determine whether a user's input is a task that requires **human action** and cannot be performed by a search engine.\n\n"
+        "Tasks that require a human include physical actions, reminders, personal errands, or actions that need personal interaction or execution. These cannot be answered by searching online.\n\n"
+        "Examples of such tasks:\n"
+        "- Walk my dog\n"
+        "- Call my mom\n"
+        "- Add milk to my shopping list\n"
+        "- Send an email to Alex\n"
+        "- Schedule a meeting at 5 PM\n\n"
+        "Examples of things that are **not** human-only tasks (these can be answered by a search engine):\n"
+        "- How to walk a dog properly?\n"
+        "- Best shopping list apps\n"
+        "- How to schedule a Google Calendar event?\n"
+        "- What to say in an email to a professor?\n"
+        "- What’s the weather tomorrow in Bangalore?\n\n"
+        "Reply ONLY with:\n"
+        "'yes' → if the input is a human-only task\n"
+        "'no' → if it is **not** a human-only task\n"
+        "No other text or explanation."
     )),
     HumanMessage(content="{query}")
 ])
+
 
 # ------------------ Gemini Model ------------------
 model = ChatGoogleGenerativeAI(model="gemini-2.5-pro", api_key=google_api_key)
@@ -193,9 +183,14 @@ async def perform_search(search_query: SearchQuery):
         if not response or not hasattr(response, "content"):
             raise HTTPException(status_code=500, detail="No validation response received.")
         verdict = response.content.strip().lower()
-        logger.info(f"Valid query? → {verdict}")
-        if verdict != "yes":
-            raise HTTPException(status_code=400, detail="Query is not suitable for web search.")
+        logger.info(f"Is it a human-only task? → {verdict}")
+        if verdict == "yes":
+             raise HTTPException(status_code=400, detail="This is not a valid query.")
+        elif verdict not in {"yes", "no"}:
+            logger.error(f"Unexpected verdict from validation model: {verdict}")
+            raise HTTPException(status_code=500, detail="Invalid response from validation model.")
+    except HTTPException as e:
+        raise e
     except Exception as e:
         logger.error(f"Error during query validation: {e}")
         raise HTTPException(status_code=500, detail=f"Query validation failed: {str(e)}")
@@ -266,7 +261,6 @@ async def perform_search(search_query: SearchQuery):
                 if attempt == retries - 1:
                     raise HTTPException(status_code=500, detail="Max retries reached. Failed to load search results page.")
                 await page.wait_for_timeout(2000)
-
         top_results = []
         for elem in elements[:10]:
             href = await elem.get_attribute("href")
@@ -278,13 +272,10 @@ async def perform_search(search_query: SearchQuery):
                 })
             if len(top_results) == 5:
                 break
-
         all_scraped_texts = []
         sources = []
-
         if not top_results:
             raise HTTPException(status_code=500, detail="No valid search results found.")
-
         logger.info("Top 5 Search Results:")
         for i, result in enumerate(top_results, start=1):
             logger.info(f"[{i}] {result['title']}\nURL: {result['url']}")
@@ -292,13 +283,10 @@ async def perform_search(search_query: SearchQuery):
             if text:
                 all_scraped_texts.append(text)
                 sources.append({"url": result["url"], "title": result["title"]})
-
         await context.close()
         await browser.close()
-
         if not all_scraped_texts:
             raise HTTPException(status_code=500, detail="No valid content scraped from any page.")
-
         logger.info("Generating summary with Gemini...")
         max_content_length = 5000
         truncated_texts = [text[:max_content_length] for text in all_scraped_texts]
@@ -308,7 +296,6 @@ async def perform_search(search_query: SearchQuery):
             f"User query: {user_query}\n\n"
             f"Scraped Content:\n\n" + "\n\n---\n\n".join(truncated_texts)
         )
-
         try:
             summary = model.invoke(summary_prompt)
             if hasattr(summary, "content"):
@@ -318,7 +305,6 @@ async def perform_search(search_query: SearchQuery):
         except Exception as e:
             logger.error(f"Error during summary generation: {e}")
             raise HTTPException(status_code=500, detail=f"Summary generation failed: {str(e)}")
-
         # Store in ChromaDB
         try:
             logger.info(f"Storing query: {normalized_query}")
@@ -343,7 +329,6 @@ async def perform_search(search_query: SearchQuery):
             logger.info(f"Total documents in ChromaDB: {collection.count()}")
         except Exception as e:
             logger.error(f"Failed to store in ChromaDB: {e}")
-
         return SearchResponse(
             query=user_query,
             normalized_query=normalized_query,
