@@ -120,7 +120,7 @@ validation_prompt = ChatPromptTemplate.from_messages([
 ])
 
 # ------------------ Gemini Model ------------------
-model = ChatGoogleGenerativeAI(model="gemini-2.5-pro", api_key=google_api_key)
+model = ChatGoogleGenerativeAI(model="gemini-2.5-pro", api_key=google_api_key , temperature=0.1)
 
 # ------------------ Popup Handling ------------------
 async def handle_popups(page):
