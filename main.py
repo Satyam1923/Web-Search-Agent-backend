@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ------------------ FastAPI App ------------------
 app = FastAPI(title="Web Search API", description="API for performing web searches and generating summaries.")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -118,7 +119,6 @@ validation_prompt = ChatPromptTemplate.from_messages([
     HumanMessage(content="{query}")
 ])
 
-
 # ------------------ Gemini Model ------------------
 model = ChatGoogleGenerativeAI(model="gemini-2.5-pro", api_key=google_api_key)
 
@@ -185,7 +185,7 @@ async def perform_search(search_query: SearchQuery):
         verdict = response.content.strip().lower()
         logger.info(f"Is it a human-only task? → {verdict}")
         if verdict == "yes":
-             raise HTTPException(status_code=400, detail="This is not a valid query.")
+            raise HTTPException(status_code=400, detail="This is not a valid query.")
         elif verdict not in {"yes", "no"}:
             logger.error(f"Unexpected verdict from validation model: {verdict}")
             raise HTTPException(status_code=500, detail="Invalid response from validation model.")
@@ -261,6 +261,7 @@ async def perform_search(search_query: SearchQuery):
                 if attempt == retries - 1:
                     raise HTTPException(status_code=500, detail="Max retries reached. Failed to load search results page.")
                 await page.wait_for_timeout(2000)
+
         top_results = []
         for elem in elements[:10]:
             href = await elem.get_attribute("href")
@@ -272,10 +273,12 @@ async def perform_search(search_query: SearchQuery):
                 })
             if len(top_results) == 5:
                 break
+
         all_scraped_texts = []
         sources = []
         if not top_results:
             raise HTTPException(status_code=500, detail="No valid search results found.")
+
         logger.info("Top 5 Search Results:")
         for i, result in enumerate(top_results, start=1):
             logger.info(f"[{i}] {result['title']}\nURL: {result['url']}")
@@ -283,10 +286,13 @@ async def perform_search(search_query: SearchQuery):
             if text:
                 all_scraped_texts.append(text)
                 sources.append({"url": result["url"], "title": result["title"]})
+
         await context.close()
-        await browser.close()
+        browser.close()
+
         if not all_scraped_texts:
             raise HTTPException(status_code=500, detail="No valid content scraped from any page.")
+
         logger.info("Generating summary with Gemini...")
         max_content_length = 5000
         truncated_texts = [text[:max_content_length] for text in all_scraped_texts]
@@ -296,6 +302,7 @@ async def perform_search(search_query: SearchQuery):
             f"User query: {user_query}\n\n"
             f"Scraped Content:\n\n" + "\n\n---\n\n".join(truncated_texts)
         )
+
         try:
             summary = model.invoke(summary_prompt)
             if hasattr(summary, "content"):
@@ -305,6 +312,7 @@ async def perform_search(search_query: SearchQuery):
         except Exception as e:
             logger.error(f"Error during summary generation: {e}")
             raise HTTPException(status_code=500, detail=f"Summary generation failed: {str(e)}")
+
         # Store in ChromaDB
         try:
             logger.info(f"Storing query: {normalized_query}")
@@ -329,6 +337,7 @@ async def perform_search(search_query: SearchQuery):
             logger.info(f"Total documents in ChromaDB: {collection.count()}")
         except Exception as e:
             logger.error(f"Failed to store in ChromaDB: {e}")
+
         return SearchResponse(
             query=user_query,
             normalized_query=normalized_query,
