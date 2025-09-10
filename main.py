@@ -6,6 +6,7 @@ import os
 import getpass
 import asyncio
 import string
+from collections import Counter
 import json
 from playwright.async_api import async_playwright, TimeoutError
 from langchain_core.prompts import ChatPromptTemplate
@@ -15,6 +16,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 import chromadb
 from numpy import dot
+import re
 from numpy.linalg import norm
 from typing import List, Dict
 import logging
@@ -168,15 +170,33 @@ async def scrape_page(page, url: str, retries: int = 3, timeout: int = 80000) ->
             logger.warning(f"Failed to scrape {url} (attempt {attempt + 1}/{retries}): {e}")
     return None
 
-# ------------------ Search Endpoint ------------------
+def safe_json_extract(raw_text: str):
+    """Try to extract JSON list from model output safely."""
+    try:
+        match = re.search(r"\[.*\]", raw_text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+    except Exception as e:
+        logger.warning(f"Safe JSON extraction failed: {e}")
+    return []
+
+
+@app.get("/")
+def hello():
+    return {
+        "message":"Hello world"
+    }
+
+
+# ------------------ Search Endpoint -----------------
 @app.post("/search", response_model=SearchResponse)
 async def perform_search(search_query: SearchQuery):
-    """Perform a web search and return a summary with sources."""
+    """Perform a web search and return a summary with sources + ranked entities."""
     user_query = search_query.query.strip()
     normalized_query = normalize_query(user_query)
     logger.info(f"Normalized query: {normalized_query}")
 
-    # Query validation
+    # --- Query validation ---
     try:
         chain = validation_prompt | model
         response = chain.invoke({"query": normalized_query})
@@ -195,7 +215,7 @@ async def perform_search(search_query: SearchQuery):
         logger.error(f"Error during query validation: {e}")
         raise HTTPException(status_code=500, detail=f"Query validation failed: {str(e)}")
 
-    # Semantic similarity check
+    # --- Semantic similarity check ---
     try:
         results = vector_store.similarity_search_with_score(normalized_query, k=1)
         if results:
@@ -206,8 +226,8 @@ async def perform_search(search_query: SearchQuery):
             stored_embedding = embeddings.embed_query(stored_query)
             current_embedding = embeddings.embed_query(normalized_query)
             debug_similarity = cosine_similarity(stored_embedding, current_embedding)
-            logger.info(f"Debug cosine similarity between '{normalized_query}' and stored '{stored_query}': {debug_similarity}")
-            if debug_similarity > 0.8:  # Use cosine similarity threshold
+            logger.info(f"Debug cosine similarity: {debug_similarity}")
+            if debug_similarity > 0.8:
                 logger.info("Query already exists in ChromaDB.")
                 summary_text = doc.metadata.get("summary", "No summary available.")
                 sources_json = doc.metadata.get("sources", "[]")
@@ -220,19 +240,22 @@ async def perform_search(search_query: SearchQuery):
                     stored_queries=list_stored_queries()
                 )
             else:
-                logger.info(f"No sufficiently similar query found (cosine similarity: {debug_similarity}). Proceeding to scrape.")
+                logger.info("No sufficiently similar query found, proceeding to scrape.")
         else:
             logger.info("No matching queries found in ChromaDB.")
     except Exception as e:
         logger.error(f"Error during similarity search: {e}")
 
+    # --- Web search with DuckDuckGo ---
     logger.info("Searching DuckDuckGo...")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
         context = await browser.new_context()
         page = await context.new_page()
         search_url = f"https://duckduckgo.com/?q={user_query.replace(' ', '+')}"
+
         retries = 3
+        elements = None
         for attempt in range(retries):
             try:
                 logger.info(f"Attempting to load search page (attempt {attempt + 1}/{retries})")
@@ -243,7 +266,6 @@ async def perform_search(search_query: SearchQuery):
                     ".result__a",
                     "h2 > a",
                 ]
-                elements = None
                 for selector in selectors:
                     try:
                         await page.wait_for_selector(selector, timeout=10000)
@@ -257,11 +279,12 @@ async def perform_search(search_query: SearchQuery):
                     raise HTTPException(status_code=500, detail="No search results found with any selector.")
                 break
             except Exception as e:
-                logger.warning(f"Attempt {attempt + 1}/{retries} failed to load search page: {e}")
+                logger.warning(f"Attempt {attempt + 1}/{retries} failed: {e}")
                 if attempt == retries - 1:
-                    raise HTTPException(status_code=500, detail="Max retries reached. Failed to load search results page.")
+                    raise HTTPException(status_code=500, detail="Max retries reached.")
                 await page.wait_for_timeout(2000)
 
+        # --- Collect top results ---
         top_results = []
         for elem in elements[:10]:
             href = await elem.get_attribute("href")
@@ -274,10 +297,17 @@ async def perform_search(search_query: SearchQuery):
             if len(top_results) == 5:
                 break
 
-        all_scraped_texts = []
-        sources = []
         if not top_results:
             raise HTTPException(status_code=500, detail="No valid search results found.")
+
+        # --- Scrape pages + extract entities ---
+        all_scraped_texts = []
+        sources = []
+        extracted_entities = []
+        scraped_snippets = "\n\n".join([text[:2000] for text in all_scraped_texts])
+        with open("scraped_pages.txt", "w", encoding="utf-8") as f:
+            f.write(f"Query: {user_query}\n")
+            f.write(f"Normalized Query: {normalized_query}\n\n")
 
         logger.info("Top 5 Search Results:")
         for i, result in enumerate(top_results, start=1):
@@ -287,21 +317,88 @@ async def perform_search(search_query: SearchQuery):
                 all_scraped_texts.append(text)
                 sources.append({"url": result["url"], "title": result["title"]})
 
+                # Save scraped raw content
+                with open("scraped_pages.txt", "a", encoding="utf-8") as f:
+                    f.write(f"--- Page {i}: {result['title']} ---\n")
+                    f.write(f"URL: {result['url']}\n\n")
+                    f.write(text)
+                    f.write("\n\n" + "="*100 + "\n\n")
+
+                # --- Extract entities with Gemini ---
+                extract_prompt = (
+                    f"Extract the key entities relevant to the user query.\n\n"
+                    f"User Query: {user_query}\n\n"
+                    f"Page Title: {result['title']}\n"
+                    f"Page Content:\n{text[:3000]}\n\n"
+                    "Return ONLY a JSON list of entities like this: [\"Entity1\", \"Entity2\", ...]"
+                )
+                try:
+                    extraction = model.invoke(extract_prompt)
+                    if hasattr(extraction, "content"):
+                        entities = safe_json_extract(extraction.content)
+                        if entities:
+                            extracted_entities.append({
+                                "source_rank": i,  # lower rank = higher priority
+                                "url": result["url"],
+                                "title": result["title"],
+                                "entities": entities
+                            })
+                except Exception as e:
+                    logger.warning(f"Entity extraction failed for {result['url']}: {e}")
+
         await context.close()
-        browser.close()
+        await browser.close()
 
         if not all_scraped_texts:
             raise HTTPException(status_code=500, detail="No valid content scraped from any page.")
 
+        # --- Merge and rank entities (majority voting + weighted by source rank) ---
+        from collections import defaultdict
+
+        def rank_entities(extracted_entities):
+            scores = defaultdict(float)
+            counts = defaultdict(int)
+
+            for site in extracted_entities:
+                source_weight = 1.0 / site["source_rank"]  # higher rank → higher weight
+                for pos, entity in enumerate(site["entities"], start=1):
+                    scores[entity] += source_weight / pos
+                    counts[entity] += 1
+
+            ranked = [
+                (entity, round(score, 4), counts[entity])
+                for entity, score in scores.items()
+            ]
+            ranked_sorted = sorted(ranked, key=lambda x: (-x[1], -x[2]))
+            return ranked_sorted
+
+        ranked_entities = rank_entities(extracted_entities)
+        logger.info(f"Ranked entities: {ranked_entities}")
+
+        # --- Save ranked entities ---
+        with open("ranked_entities.txt", "w", encoding="utf-8") as f:
+            f.write(f"Query: {user_query}\n")
+            f.write(f"Normalized Query: {normalized_query}\n\n")
+            f.write("Ranked Entities (entity -> score | count):\n\n")
+            for idx, (entity, score, count) in enumerate(ranked_entities, start=1):
+                f.write(f"{idx}. {entity} -> {score} | {count}\n")
+
+        # --- Generate summary ---
         logger.info("Generating summary with Gemini...")
-        max_content_length = 5000
-        truncated_texts = [text[:max_content_length] for text in all_scraped_texts]
         summary_prompt = (
-            "Summarize the following content into a concise and informative response "
-            "based on the user's query:\n\n"
-            f"User query: {user_query}\n\n"
-            f"Scraped Content:\n\n" + "\n\n---\n\n".join(truncated_texts)
-        )
+    f"User query: {user_query}\n\n"
+    "Ranked entities with scores and frequency:\n"
+    f"{json.dumps(ranked_entities, indent=2)}\n\n"
+    "Scraped content snippets from different sources:\n"
+    f"{scraped_snippets}\n\n"
+    "Write a comprehensive, descriptive answer:\n"
+    "- Clearly mention the top-ranked entities.\n"
+    "- Provide a 3–5 sentence description of each, using details from the scraped text.\n"
+    "- If sources disagree, highlight the differences.\n"
+    "- Use an informative and engaging tone suitable for readers."
+)
+
+
 
         try:
             summary = model.invoke(summary_prompt)
@@ -313,7 +410,7 @@ async def perform_search(search_query: SearchQuery):
             logger.error(f"Error during summary generation: {e}")
             raise HTTPException(status_code=500, detail=f"Summary generation failed: {str(e)}")
 
-        # Store in ChromaDB
+        # --- Store in ChromaDB ---
         try:
             logger.info(f"Storing query: {normalized_query}")
             pre_store_embedding = embeddings.embed_query(normalized_query)
@@ -322,18 +419,10 @@ async def perform_search(search_query: SearchQuery):
                 metadatas=[{
                     "query": normalized_query,
                     "summary": summary_text,
-                    "sources": json.dumps(sources)
+                    "sources": json.dumps(sources),
+                    "ranked_entities": json.dumps(ranked_entities)
                 }]
             )
-            results = vector_store.similarity_search_with_score(normalized_query, k=1)
-            if results:
-                doc, score = results[0]
-                logger.info(f"Stored query: {doc.metadata['query']}, Similarity score: {score}")
-                post_store_embedding = embeddings.embed_query(doc.metadata['query'])
-                debug_similarity = cosine_similarity(pre_store_embedding, post_store_embedding)
-                logger.info(f"Debug cosine similarity between pre-store and post-store '{normalized_query}': {debug_similarity}")
-            else:
-                logger.error("Document was not stored in ChromaDB.")
             logger.info(f"Total documents in ChromaDB: {collection.count()}")
         except Exception as e:
             logger.error(f"Failed to store in ChromaDB: {e}")
